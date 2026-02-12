@@ -370,6 +370,72 @@
 
   #file-input { display: none; }
 
+  /* ── Dataset selector bar ── */
+  .dataset-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 0 24px 16px;
+  }
+
+  .dataset-bar:empty { display: none; }
+
+  .dataset-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 6px 12px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .dataset-chip:hover {
+    border-color: var(--text-muted);
+    color: var(--text-primary);
+  }
+
+  .dataset-chip.active {
+    border-color: var(--accent);
+    background: var(--accent-dim);
+    color: var(--accent);
+  }
+
+  .dataset-chip .chip-rows {
+    font-size: 0.6rem;
+    color: var(--text-muted);
+  }
+
+  .dataset-chip.active .chip-rows {
+    color: var(--accent);
+    opacity: 0.7;
+  }
+
+  .dataset-chip .chip-remove {
+    margin-left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.65rem;
+    line-height: 1;
+    color: var(--text-muted);
+    transition: all 0.15s ease;
+  }
+
+  .dataset-chip .chip-remove:hover {
+    background: var(--red);
+    color: white;
+  }
+
   /* ── Data Table ── */
   .data-panel { border-right: 1px solid var(--border); }
 
@@ -800,6 +866,7 @@
           <p>or <em>click to browse</em> · supports .csv, .tsv</p>
         </div>
       </div>
+      <div id="dataset-bar" class="dataset-bar"></div>
     </div>
 
     <!-- Data Preview Panel -->
@@ -854,12 +921,28 @@
 const API_BASE = 'http://localhost:8765';
 
 // ── State ──
+// Each dataset: { name, csvData, csvHeaders, serverTable, rows, size }
+let datasets = [];
+let activeIdx = -1;          // index into datasets[]
+let backendConnected = false;
+
+// Active dataset shortcuts — kept in sync by syncActive()
 let csvData = [];
 let csvHeaders = [];
-let fileName = '';
-let backendFile = null;     // raw File object for upload to backend
-let backendConnected = false;
-let serverTable = null;     // table name in PostgreSQL after upload
+let serverTable = null;
+
+function syncActive() {
+  const ds = datasets[activeIdx];
+  if (ds) {
+    csvData = ds.csvData;
+    csvHeaders = ds.csvHeaders;
+    serverTable = ds.serverTable;
+  } else {
+    csvData = [];
+    csvHeaders = [];
+    serverTable = null;
+  }
+}
 
 // ── DOM refs ──
 const uploadZone = document.getElementById('upload-zone');
@@ -881,8 +964,9 @@ async function checkHealth() {
     if (data.status === 'connected') {
       backendConnected = true;
       statusDot.className = 'status-dot';
-      statusText.textContent = 'CONNECTED';
-      if (data.table) serverTable = data.table;
+      statusText.textContent = datasets.length
+        ? `CONNECTED · ${datasets.length} table${datasets.length > 1 ? 's' : ''}`
+        : 'CONNECTED';
     } else {
       setDisconnected(data.error || 'DB error');
     }
@@ -902,7 +986,7 @@ checkHealth();
 setInterval(checkHealth, 5000);
 
 // ── Upload CSV to backend ──
-async function uploadToBackend(file) {
+async function uploadToBackend(file, dsIndex) {
   if (!backendConnected) return;
   try {
     const formData = new FormData();
@@ -913,7 +997,12 @@ async function uploadToBackend(file) {
       addAssistantMessage(`<span style="color:var(--red)">Server upload error:</span> ${escHtml(data.error)}`);
       return;
     }
-    serverTable = data.table.split('.')[1]; // extract table name without schema
+    // Update the dataset's server table name
+    if (datasets[dsIndex]) {
+      datasets[dsIndex].serverTable = data.table.split('.')[1];
+      syncActive();
+      renderDatasetBar();
+    }
     addAssistantMessage(
       `Loaded into PostgreSQL table <code>${escHtml(data.table)}</code> — `
       + `<strong>${data.rows_loaded.toLocaleString()}</strong> rows. `
@@ -951,8 +1040,6 @@ fileInput.addEventListener('change', e => {
 
 // ── File handling ──
 function handleFile(file) {
-  fileName = file.name;
-  backendFile = file;
   const size = file.size < 1024 ? file.size + ' B'
     : file.size < 1048576 ? (file.size / 1024).toFixed(1) + ' KB'
     : (file.size / 1048576).toFixed(1) + ' MB';
@@ -961,19 +1048,34 @@ function handleFile(file) {
     header: true,
     skipEmptyLines: true,
     complete: result => {
-      csvHeaders = result.meta.fields || [];
-      csvData = result.data;
-      renderFileInfo(file.name, size, csvData.length, csvHeaders.length);
+      const headers = result.meta.fields || [];
+      const data = result.data;
+
+      // Create new dataset entry
+      const ds = {
+        name: file.name,
+        csvData: data,
+        csvHeaders: headers,
+        serverTable: null,
+        rows: data.length,
+        size: size,
+      };
+      datasets.push(ds);
+      activeIdx = datasets.length - 1;
+      syncActive();
+
+      renderDatasetBar();
+      renderFileInfo(file.name, size, data.length, headers.length);
       renderTable();
       enableChat();
       addAssistantMessage(
-        `Loaded <code>${escHtml(file.name)}</code> — <strong>${csvData.length.toLocaleString()}</strong> rows and <strong>${csvHeaders.length}</strong> columns.`
-        + `<div class="stat-grid">${csvHeaders.slice(0, 6).map(h =>
+        `Loaded <code>${escHtml(file.name)}</code> — <strong>${data.length.toLocaleString()}</strong> rows and <strong>${headers.length}</strong> columns.`
+        + `<div class="stat-grid">${headers.slice(0, 6).map(h =>
           `<div class="stat-card"><div class="stat-label">${escHtml(h)}</div><div class="stat-value" style="font-size:0.8rem;color:var(--text-secondary)">${inferType(h)}</div></div>`
-        ).join('')}${csvHeaders.length > 6 ? `<div class="stat-card"><div class="stat-label">+ more</div><div class="stat-value" style="font-size:0.8rem;color:var(--text-muted)">${csvHeaders.length - 6} cols</div></div>` : ''}</div>`
+        ).join('')}${headers.length > 6 ? `<div class="stat-card"><div class="stat-label">+ more</div><div class="stat-value" style="font-size:0.8rem;color:var(--text-muted)">${headers.length - 6} cols</div></div>` : ''}</div>`
       );
       // Upload to backend in parallel
-      uploadToBackend(backendFile);
+      uploadToBackend(file, activeIdx);
       renderSuggestions();
     }
   });
@@ -991,8 +1093,8 @@ function renderFileInfo(name, size, rows, cols) {
       </div>
     </div>
     <div class="file-actions">
-      <button class="btn" onclick="document.getElementById('file-input').click()">Replace</button>
-      <button class="btn btn-danger" onclick="clearFile()">Remove</button>
+      <button class="btn" onclick="document.getElementById('file-input').click()">+ Add file</button>
+      <button class="btn btn-danger" onclick="removeDataset(${activeIdx})">Remove</button>
     </div>
   `;
   // Re-add hidden input
@@ -1007,12 +1109,61 @@ function renderFileInfo(name, size, rows, cols) {
   }
 }
 
-function clearFile() {
-  csvData = [];
-  csvHeaders = [];
-  fileName = '';
-  backendFile = null;
-  serverTable = null;
+// ── Dataset bar (chip selector) ──
+function renderDatasetBar() {
+  const bar = document.getElementById('dataset-bar');
+  if (datasets.length <= 1) { bar.innerHTML = ''; return; }
+  bar.innerHTML = datasets.map((ds, i) =>
+    `<div class="dataset-chip${i === activeIdx ? ' active' : ''}" onclick="switchDataset(${i})">
+      <span>${escHtml(ds.name)}</span>
+      <span class="chip-rows">${ds.rows.toLocaleString()} rows</span>
+      <span class="chip-remove" onclick="event.stopPropagation(); removeDataset(${i})" title="Remove">&times;</span>
+    </div>`
+  ).join('');
+}
+
+function switchDataset(idx) {
+  if (idx < 0 || idx >= datasets.length || idx === activeIdx) return;
+  activeIdx = idx;
+  syncActive();
+  const ds = datasets[idx];
+  renderDatasetBar();
+  renderFileInfo(ds.name, ds.size, ds.rows, ds.csvHeaders.length);
+  renderTable();
+  enableChat();
+  addAssistantMessage(`Switched to <code>${escHtml(ds.name)}</code> — <strong>${ds.rows.toLocaleString()}</strong> rows.`);
+}
+
+async function removeDataset(idx) {
+  if (idx < 0 || idx >= datasets.length) return;
+  const ds = datasets[idx];
+
+  // Delete from backend if it was uploaded
+  if (backendConnected && ds.serverTable) {
+    try {
+      await fetch(`${API_BASE}/tables/${encodeURIComponent(ds.serverTable)}`, { method: 'DELETE' });
+    } catch { /* best effort */ }
+  }
+
+  datasets.splice(idx, 1);
+
+  if (datasets.length === 0) {
+    // No datasets left — reset to empty state
+    activeIdx = -1;
+    syncActive();
+    resetToEmpty();
+  } else {
+    // Adjust active index
+    if (idx <= activeIdx) activeIdx = Math.max(0, activeIdx - 1);
+    syncActive();
+    const ds2 = datasets[activeIdx];
+    renderDatasetBar();
+    renderFileInfo(ds2.name, ds2.size, ds2.rows, ds2.csvHeaders.length);
+    renderTable();
+  }
+}
+
+function resetToEmpty() {
   uploadZone.classList.remove('has-file');
   uploadZone.onclick = () => document.getElementById('file-input').click();
   uploadZone.innerHTML = `
@@ -1028,6 +1179,7 @@ function clearFile() {
   document.getElementById('file-input').addEventListener('change', e => {
     if (e.target.files[0]) handleFile(e.target.files[0]);
   });
+  renderDatasetBar();
   tableArea.innerHTML = `<div class="empty-state">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
     <p>Upload a CSV file to preview<br>your data here</p>

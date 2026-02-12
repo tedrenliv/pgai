@@ -485,9 +485,16 @@ Many specialized vector databases create embeddings for you. However, they typic
 
 ## CSV Data Explorer
 
-A browser-based UI that lets you upload CSV files into PostgreSQL and ask natural language questions. An LLM generates SQL queries, executes them against your data, and returns computed answers (sums, averages, counts, etc.).
+A browser-based UI that lets you upload **multiple CSV files** into PostgreSQL and ask natural language questions. An LLM generates SQL queries, executes them against your data, and returns computed answers (sums, averages, counts, JOINs across tables, etc.).
 
 **Architecture:** Browser UI → FastAPI backend → PostgreSQL (data storage & SQL execution) + OpenAI-compatible LLM (SQL generation & answer formatting).
+
+### Features
+
+- **Multi-file support** — Upload multiple CSV files; each becomes a separate PostgreSQL table. A dataset selector bar lets you switch between loaded files.
+- **Cross-table queries** — The LLM sees all loaded table schemas, so it can JOIN tables or pick the right one automatically.
+- **SQL self-healing** — If the generated SQL fails (e.g. type mismatch), the error is sent back to the LLM for automatic correction and retry.
+- **Smart type inference** — ID columns are always stored as `text` to prevent JOIN type mismatches; numeric detection requires 100% of sampled values to be numeric.
 
 ### Prerequisites
 
@@ -528,9 +535,10 @@ uv run python ../../csv_server.py
 
 ### Usage
 
-1. **Upload** — Drag and drop a CSV file (or click to browse). The file is parsed, loaded into a PostgreSQL table in the `csvdata` schema, and the status dot turns green.
-2. **Ask** — Type a natural language question like "What is the total value of all orders?" or "Which customer has the most purchases?"
-3. **Answer** — The LLM generates a SQL query (with aggregations like SUM, AVG, COUNT), executes it against PostgreSQL, and returns a formatted answer. The executed SQL is shown in a collapsible detail block.
+1. **Upload** — Drag and drop a CSV file (or click to browse). The file is parsed, loaded into a PostgreSQL table in the `csvdata` schema, and the status dot turns green. Click **"+ Add file"** to load additional CSVs.
+2. **Switch** — When multiple files are loaded, use the dataset selector bar to switch between tables. Each chip shows the table name and row count.
+3. **Ask** — Type a natural language question like "What is the total value of all orders?" or "Which customer has the most purchases?" The LLM can query any loaded table or JOIN across them.
+4. **Answer** — The LLM generates a SQL query (with aggregations like SUM, AVG, COUNT), executes it against PostgreSQL, and returns a formatted answer. The executed SQL is shown in a collapsible detail block.
 
 The UI also includes a local JavaScript fallback for basic queries (row counts, column stats) when the backend is unavailable.
 

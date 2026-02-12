@@ -54,8 +54,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Track which table is currently loaded
-current_table: str | None = None
+# Track all loaded tables: {table_name: {columns, types, rows, filename}}
+loaded_tables: dict[str, dict] = {}
 
 # Path to the HTML frontend
 HTML_PATH = Path(__file__).parent / "csv-query.html"
@@ -79,15 +79,20 @@ def sanitize_name(name: str) -> str:
     return s[:63]  # PG identifier max length
 
 
-def infer_pg_type(values: list[str]) -> str:
+def infer_pg_type(values: list[str], col_name: str = "") -> str:
     """Guess a PostgreSQL column type from sample values."""
     non_empty = [v for v in values if v.strip()]
     if not non_empty:
         return "text"
-    # Try numeric
+    # ID columns are always text — they may look numeric in one table
+    # but be alphanumeric in another, causing JOIN type mismatches.
+    if col_name.endswith("_id") or col_name == "id":
+        return "text"
+    # Try numeric — require ALL sampled values to be numeric
     numeric_count = 0
     has_dot = False
-    for v in non_empty[:50]:
+    sample = non_empty[:100]
+    for v in sample:
         cleaned = v.replace(",", "").strip()
         try:
             float(cleaned)
@@ -96,7 +101,7 @@ def infer_pg_type(values: list[str]) -> str:
                 has_dot = True
         except ValueError:
             pass
-    if numeric_count > len(non_empty[:50]) * 0.8:
+    if numeric_count == len(sample):
         return "double precision" if has_dot else "bigint"
     return "text"
 
@@ -113,10 +118,43 @@ async def health():
             return {
                 "status": "connected",
                 "database": DB_URL.split("/")[-1].split("?")[0],
-                "table": current_table,
+                "tables": list(loaded_tables.keys()),
             }
     except Exception as e:
         return {"status": "disconnected", "error": str(e)}
+
+
+@app.get("/tables")
+async def list_tables():
+    """List all loaded CSV tables with metadata."""
+    return {
+        name: {
+            "filename": info["filename"],
+            "columns": info["columns"],
+            "rows": info["rows"],
+        }
+        for name, info in loaded_tables.items()
+    }
+
+
+@app.delete("/tables/{table_name}")
+async def delete_table(table_name: str):
+    """Drop a loaded CSV table."""
+    if table_name not in loaded_tables:
+        return {"error": f"Table '{table_name}' not found."}
+    try:
+        async with await psycopg.AsyncConnection.connect(DB_URL) as con:
+            await con.execute(
+                psycopg.sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
+                    psycopg.sql.Identifier(SCHEMA),
+                    psycopg.sql.Identifier(table_name),
+                )
+            )
+            await con.commit()
+        del loaded_tables[table_name]
+        return {"deleted": table_name, "remaining": list(loaded_tables.keys())}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ── Upload ───────────────────────────────────────────────────────────────────
@@ -125,8 +163,6 @@ async def health():
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
     """Parse uploaded CSV, create table in PostgreSQL, load data."""
-    global current_table
-
     content = await file.read()
     text = content.decode("utf-8-sig")  # handle BOM
     reader = csv.reader(io.StringIO(text))
@@ -155,12 +191,17 @@ async def upload_csv(file: UploadFile = File(...)):
     col_types: list[str] = []
     for ci in range(len(col_names)):
         sample = [r[ci] if ci < len(r) else "" for r in data_rows[:100]]
-        col_types.append(infer_pg_type(sample))
+        col_types.append(infer_pg_type(sample, col_names[ci]))
 
-    # Table name from file name
-    table_name = sanitize_name(
+    # Table name from file name — deduplicate if already loaded
+    base_table = sanitize_name(
         os.path.splitext(file.filename or "upload")[0]
     ) or "csv_data"
+    table_name = base_table
+    suffix = 2
+    while table_name in loaded_tables:
+        table_name = f"{base_table}_{suffix}"
+        suffix += 1
 
     try:
         async with await psycopg.AsyncConnection.connect(DB_URL) as con:
@@ -170,7 +211,7 @@ async def upload_csv(file: UploadFile = File(...)):
                     psycopg.sql.Identifier(SCHEMA)
                 )
             )
-            # Drop old table if exists
+            # Drop if exists (safety net)
             await con.execute(
                 psycopg.sql.SQL("DROP TABLE IF EXISTS {}.{}").format(
                     psycopg.sql.Identifier(SCHEMA),
@@ -219,7 +260,14 @@ async def upload_csv(file: UploadFile = File(...)):
                 await con.execute(insert_sql, values)
 
             await con.commit()
-            current_table = table_name
+
+            # Track the table
+            loaded_tables[table_name] = {
+                "filename": file.filename or "upload.csv",
+                "columns": col_names,
+                "types": col_types,
+                "rows": len(data_rows),
+            }
 
             return {
                 "table": f"{SCHEMA}.{table_name}",
@@ -337,9 +385,13 @@ def extract_sql(text: str) -> str | None:
 @app.post("/query")
 async def query_data(req: QueryRequest):
     """Two-step SQL-RAG: LLM generates SQL → execute → LLM formats answer."""
-    table = req.table or current_table
+    table = req.table
     if not table:
-        return {"error": "No table loaded. Upload a CSV first."}
+        # Default to the most recently loaded table
+        if loaded_tables:
+            table = list(loaded_tables.keys())[-1]
+        else:
+            return {"error": "No table loaded. Upload a CSV first."}
 
     try:
         async with await psycopg.AsyncConnection.connect(DB_URL) as con:
@@ -352,14 +404,35 @@ async def query_data(req: QueryRequest):
 
             full_table = f'"{SCHEMA}"."{table}"'
 
+            # Build context for ALL loaded tables so LLM can JOIN or pick
+            all_tables_context = ""
+            if len(loaded_tables) > 1:
+                for tname in loaded_tables:
+                    t_schema, t_sample, t_rows = await get_table_context(
+                        con, tname
+                    )
+                    t_full = f'"{SCHEMA}"."{tname}"'
+                    all_tables_context += (
+                        f"\nTable: {t_full} ({t_rows} rows)\n"
+                        f"Columns:\n{t_schema}\n"
+                        f"Sample data:\n{t_sample}\n"
+                    )
+            else:
+                all_tables_context = (
+                    f"\nTable: {full_table} ({total_rows} rows)\n"
+                    f"Columns:\n{schema_desc}\n"
+                    f"Sample data:\n{sample_text}\n"
+                )
+
             # ── Step 1: Ask LLM to generate a SQL query ──
             gen_sql_prompt = (
-                f"You are a PostgreSQL expert. Given this table:\n\n"
-                f"Table: {full_table} ({total_rows} rows)\n"
-                f"Columns:\n{schema_desc}\n\n"
-                f"Sample data:\n{sample_text}\n"
+                f"You are a PostgreSQL expert. "
+                f"The following tables are available in the database:\n"
+                f"{all_tables_context}\n"
                 f"Write a single SQL SELECT query to answer the user's question. "
-                f"Use the full table path {full_table}. "
+                f"Always use the full table path (e.g. \"{SCHEMA}\".\"table_name\"). "
+                f"You may JOIN multiple tables if the question requires data from "
+                f"more than one table. "
                 f"Return ONLY the SQL query inside a ```sql code block. "
                 f"Use aggregation functions (SUM, AVG, COUNT, MIN, MAX) when "
                 f"the question asks for totals, averages, counts, etc. "
@@ -373,53 +446,86 @@ async def query_data(req: QueryRequest):
             query_error = ""
             executed_sql = ""
 
-            if generated_sql:
-                # ── Step 2: Execute the SQL query (read-only) ──
-                executed_sql = generated_sql
+            async def try_execute(sql: str) -> tuple[str, str]:
+                """Try to execute SQL. Returns (result_text, error)."""
                 try:
-                    # Use a savepoint so errors don't break the connection
                     await con.execute("SAVEPOINT query_exec")
                     await con.execute(
                         "SET LOCAL statement_timeout = '10s'"
                     )
-                    cur = await con.execute(generated_sql)
+                    cur = await con.execute(sql)
                     rows = await cur.fetchall()
                     col_names = [d[0] for d in cur.description or []]
 
                     if rows:
-                        # Format results as a readable table
                         header = " | ".join(col_names)
-                        separator = " | ".join("-" * len(c) for c in col_names)
+                        separator = " | ".join(
+                            "-" * len(c) for c in col_names
+                        )
                         data_lines = []
                         for row in rows[:50]:
                             data_lines.append(
                                 " | ".join(str(v) for v in row)
                             )
-                        query_result_text = (
+                        result = (
                             f"{header}\n{separator}\n"
                             + "\n".join(data_lines)
                         )
                         if len(rows) > 50:
-                            query_result_text += (
-                                f"\n... ({len(rows)} total rows)"
-                            )
+                            result += f"\n... ({len(rows)} total rows)"
                     else:
-                        query_result_text = "(no rows returned)"
+                        result = "(no rows returned)"
                     await con.execute("RELEASE SAVEPOINT query_exec")
+                    return result, ""
                 except Exception as e:
-                    query_error = str(e)
                     try:
                         await con.execute(
                             "ROLLBACK TO SAVEPOINT query_exec"
                         )
                     except Exception:
                         pass
+                    return "", str(e)
+
+            if generated_sql:
+                # ── Step 2: Execute the SQL query ──
+                executed_sql = generated_sql
+                query_result_text, query_error = await try_execute(
+                    generated_sql
+                )
+
+                # ── Step 2b: Retry — if it failed, ask LLM to fix it ──
+                if query_error and not query_result_text:
+                    fix_prompt = (
+                        f"You are a PostgreSQL expert. "
+                        f"The following SQL query failed:\n"
+                        f"```sql\n{generated_sql}\n```\n\n"
+                        f"Error: {query_error}\n\n"
+                        f"Available tables:\n{all_tables_context}\n"
+                        f"Fix the query. Pay attention to column types — "
+                        f"use explicit casts (e.g. column::bigint) when "
+                        f"joining columns of different types. "
+                        f"Return ONLY the corrected SQL inside a "
+                        f"```sql code block."
+                    )
+                    fix_response = await llm_call(
+                        fix_prompt, req.question
+                    )
+                    fixed_sql = extract_sql(fix_response)
+                    if fixed_sql:
+                        executed_sql = fixed_sql
+                        query_result_text, query_error = (
+                            await try_execute(fixed_sql)
+                        )
 
             # ── Step 3: Ask LLM to format the final answer ──
+            tables_summary = ", ".join(
+                f'"{SCHEMA}"."{t}"' for t in loaded_tables
+            ) or full_table
+
             if query_result_text:
                 answer_prompt = (
                     f"You are a data analyst. The user asked a question about "
-                    f"a dataset in table {full_table} ({total_rows} rows).\n\n"
+                    f"data in these tables: {tables_summary}.\n\n"
                     f"The following SQL was executed:\n```sql\n{executed_sql}\n```\n\n"
                     f"Query results:\n```\n{query_result_text}\n```\n\n"
                     f"Provide a clear, concise answer to the user's question "
@@ -430,21 +536,18 @@ async def query_data(req: QueryRequest):
             elif query_error:
                 answer_prompt = (
                     f"You are a data analyst. The user asked a question about "
-                    f"table {full_table} ({total_rows} rows).\n\n"
-                    f"Schema:\n{schema_desc}\n\n"
-                    f"Sample data:\n{sample_text}\n"
+                    f"data in these tables: {tables_summary}.\n\n"
+                    f"Available tables:\n{all_tables_context}\n"
                     f"A SQL query was attempted but failed: {query_error}\n\n"
                     f"Try to answer the question as best you can from the "
-                    f"schema and sample data, and suggest a corrected query."
+                    f"table schemas and sample data, and suggest a corrected query."
                 )
             else:
                 answer_prompt = (
-                    f"You are a data analyst. Table {full_table} "
-                    f"({total_rows} rows).\n\n"
-                    f"Schema:\n{schema_desc}\n\n"
-                    f"Sample data:\n{sample_text}\n"
+                    f"You are a data analyst. "
+                    f"Available tables:\n{all_tables_context}\n"
                     f"Answer the user's question. If a SQL query would help, "
-                    f"provide it using the full table path {full_table}."
+                    f"provide it using full table paths like \"{SCHEMA}\".\"table_name\"."
                 )
 
             answer = await llm_call(answer_prompt, req.question)
