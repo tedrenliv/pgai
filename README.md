@@ -41,87 +41,160 @@ The key strength of this architecture lies in its resilience: data modifications
 
 </div>
 
-### install 
+### Install
 
-First, install the pgai package.
+First, install the pgai package:
 
 ```bash
 pip install pgai
-```              
-
-Then, install the pgai database components. You can do this from the terminal using the CLI or in your Python application code using the pgai python package.
-```
-# from the cli
-pgai install -d <database-url>
-
-# or from the python package, often done as part of your application setup
-import pgai
-pgai.install(DB_URL)
 ```
 
-If you are not on Timescale Cloud you will also need to run the pgai vectorizer worker. Install the dependencies for it via:
+To run the vectorizer worker (required unless you are on Timescale Cloud):
 ```bash
 pip install "pgai[vectorizer-worker]"
 ```
 
-If you are using the [semantic catalog](/docs/semantic_catalog/README.md), you will need to run:
-
+To use the [semantic catalog](/docs/semantic_catalog/README.md):
 ```bash
 pip install "pgai[semantic-catalog]"
 ```
 
+Then, install the pgai database components into your PostgreSQL database:
+```bash
+# from the cli
+pgai install -d <database-url>
+```
+
+Or from Python:
+```python
+import pgai
+pgai.install(DB_URL)
+```
+
+**Prerequisites:**
+- Python >= 3.10
+- PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) installed
+- An embedding API key (OpenAI, VoyageAI, or any [supported provider](#supported-embedding-models))
+
+<details>
+<summary>Windows-specific notes</summary>
+
+- Ensure your database uses **UTF-8 encoding**. The default Windows PostgreSQL locale uses WIN1252 which cannot handle Unicode in API error messages. Create a UTF-8 database with:
+  ```sql
+  CREATE DATABASE mydb ENCODING 'UTF8' LOCALE_PROVIDER icu ICU_LOCALE 'und' TEMPLATE template0;
+  ```
+- For pgvector on Windows, prebuilt binaries are available at [pgvector_pgsql_windows](https://github.com/andreiramani/pgvector_pgsql_windows/releases). Copy `vector.dll` to your PostgreSQL `lib/` directory and the `share/extension/vector*` files to your PostgreSQL `share/extension/` directory.
+- If you use an OpenAI-compatible provider (e.g. Zhipu AI, Azure OpenAI), the `OPENAI_API_KEY` and base URL from your provider will work — just use your provider's embedding model name when creating the vectorizer.
+</details>
+
+## Daily Workflow
+
+Once pgai is installed, this is the typical workflow for each session:
+
+```bash
+# 1. Start PostgreSQL (skip if running as a service)
+pg_ctl start -D /path/to/data -l /path/to/log.txt
+
+# 2. Run the vectorizer worker (processes any pending embeddings and exits)
+pgai vectorizer worker --once -d $DB_URL
+
+# 3. Or run continuously in the background for near-real-time updates
+pgai vectorizer worker -d $DB_URL
+```
+
+Your application just does normal INSERT/UPDATE/DELETE operations. The worker handles embedding generation automatically.
 
 # Quick Start
 
-This quickstart demonstrates how pgai Vectorizer enables semantic search and RAG over PostgreSQL data by automatically creating and synchronizing embeddings as data changes.
+This quickstart demonstrates semantic search and RAG over PostgreSQL data using pgai Vectorizer — embeddings are created and synchronized automatically as data changes.
 
 **Looking for text-to-SQL?** Check out the [Semantic Catalog quickstart](/docs/semantic_catalog/README.md) to transform natural language questions into SQL queries.
 
-The key "secret sauce" of pgai Vectorizer is its declarative approach to
-embedding generation. Simply define your pipeline and let Vectorizer handle the
-operational complexity of keeping embeddings in sync, even when embedding
-endpoints are unreliable. You can define a simple version of the pipeline as
-follows:
+## Step 1: Set up environment
 
+Create a `.env` file:
+```
+OPENAI_API_KEY=<your-api-key>
+DB_URL=postgresql://user:password@localhost:5432/mydb
+```
+
+## Step 2: Install pgai into your database
+
+```bash
+pgai install -d $DB_URL
+```
+
+## Step 3: Create a table and vectorizer
+
+Connect to your database with `psql` and run:
 ```sql
 CREATE TABLE IF NOT EXISTS wiki (
     id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     url TEXT NOT NULL,
     title TEXT NOT NULL,
     text TEXT NOT NULL
-)
+);
 
+-- Insert sample data
+INSERT INTO wiki (url, title, text) VALUES
+('https://en.wikipedia.org/wiki/PostgreSQL', 'PostgreSQL',
+ 'PostgreSQL is a powerful, open source object-relational database system with over 35 years of active development.'),
+('https://en.wikipedia.org/wiki/Aristotle', 'Aristotle',
+ 'Aristotle was an Ancient Greek philosopher and polymath. His writings cover a broad range of subjects spanning the natural sciences, philosophy, linguistics, economics, politics, psychology and the arts.');
+
+-- Create a vectorizer — this is the key "secret sauce"
 SELECT ai.create_vectorizer(
-     'wiki'::regclass,
-     loading => ai.loading_column(column_name=>'text'),
-     destination => ai.destination_table(target_table=>'wiki_embedding_storage'),
-     embedding => ai.embedding_openai(model=>'text-embedding-ada-002', dimensions=>'1536')
-    )
+    'wiki'::regclass,
+    loading => ai.loading_column(column_name=>'text'),
+    destination => ai.destination_table(view_name=>'wiki_embedding'),
+    embedding => ai.embedding_openai(model=>'text-embedding-ada-002', dimensions=>1536)
+);
 ```
 
-The vectorizer will automatically create embeddings for all the rows in the
-`wiki` table, and, more importantly, will keep the embeddings synced with the
-underlying data as it changes.  **Think of it almost like declaring an index** on
-the `wiki` table, but instead of the database managing the index datastructure
-for you, the Vectorizer is managing the embeddings. 
+Think of the vectorizer almost like declaring an index — but instead of the database managing the index data structure for you, the Vectorizer is managing the embeddings. Embeddings stay synced as your data changes.
 
-## Running the quick start
+## Step 4: Run the vectorizer worker
 
-**Prerequisites:**
-- A PostgreSQL database ([docker instructions](https://docs.timescale.com/self-hosted/latest/install/installation-docker/)).
-- An OpenAI API key (we use openai for embedding in the quick start, but you can use [multiple providers](#supported-embedding-models)).
-
-Create a `.env` file with the following:
-
-```
-OPENAI_API_KEY=<your-openai-api-key>
-DB_URL=<your-database-url>
+```bash
+pgai vectorizer worker --once -d $DB_URL
 ```
 
-You can download the full [python code](examples/quickstart/main.py) and [requirements.txt](examples/quickstart/requirements.txt) from the quickstart example and run it in the same directory as the `.env` file.
+The `--once` flag processes all pending items and exits. In production, run without `--once` for continuous background processing. See [worker documentation](/docs/vectorizer/worker.md) for details.
+
+## Step 5: Search with semantic similarity
+
+```python
+import os, psycopg
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+client = OpenAI()
+DB_URL = os.getenv("DB_URL")
+
+query = "ancient philosophy"
+resp = client.embeddings.create(model="text-embedding-ada-002", input=query)
+embedding = resp.data[0].embedding
+
+conn = psycopg.connect(DB_URL)
+cur = conn.cursor()
+cur.execute("""
+    SELECT title, chunk, embedding <=> %s::vector as distance
+    FROM wiki_embedding ORDER BY distance LIMIT 3
+""", (str(embedding),))
+
+for title, chunk, distance in cur.fetchall():
+    print(f"{title} (distance: {distance:.4f}): {chunk[:100]}...")
+```
+
+**Expected output:** Aristotle ranks first as the closest match for "ancient philosophy".
+
+## Full example
+
+You can download the full [python code](examples/quickstart/main.py) and [requirements.txt](examples/quickstart/requirements.txt) and run it:
 
 <details>
-<summary>Click here for a bash script to run the quickstart</summary>
+<summary>Click here for a bash script to run the full quickstart example</summary>
 
 ```bash
 curl -O https://raw.githubusercontent.com/timescale/pgai/main/examples/quickstart/main.py
@@ -319,8 +392,9 @@ Answer:"""
 
 ## Next steps
 
+- **[User Guide](/docs/user-guide.md)** — Practical guide covering vectorizers, semantic search, RAG, multiple providers, and production tips. Includes a [runnable demo](/examples/user_guide_demo/demo.py) that auto-detects your embedding provider.
 
-### More RAG and Vectorization Examples  
+### More RAG and Vectorization Examples
 - [FastAPI + psycopg quickstart](/examples/simple_fastapi_app/README.md)
 - [Vectorizer overview](/docs/vectorizer/overview.md) and [worker documentation](/docs/vectorizer/worker.md)
 - [Vectorizer API reference](/docs/vectorizer/api-reference.md)
@@ -401,11 +475,64 @@ Many specialized vector databases create embeddings for you. However, they typic
 - [Vector Databases Are the Wrong Abstraction](https://www.timescale.com/blog/vector-databases-are-the-wrong-abstraction/)
 - [pgai: Giving PostgreSQL Developers AI Engineering Superpowers](http://www.timescale.com/blog/pgai-giving-postgresql-developers-ai-engineering-superpowers)
 
-## Quick start guides
+## Guides and quick starts
+- **[User Guide](/docs/user-guide.md)** - Step-by-step guide with examples for vectorizers, search, RAG, and multiple providers
 - [Semantic Catalog (Text-to-SQL)](/docs/semantic_catalog/README.md) - Learn how to use the semantic catalog to improve the translation of natural language to SQL for agentic applications.
 - [The vectorizer quick start above](#quick-start)
 - [Quick start with OpenAI](/docs/vectorizer/quick-start-openai.md)
 - [Quick start with VoyageAI](/docs/vectorizer/quick-start-voyage.md)
+- [CSV Data Explorer (UI quick start)](#csv-data-explorer) - Upload CSV files and ask questions in natural language via a browser UI
+
+## CSV Data Explorer
+
+A browser-based UI that lets you upload CSV files into PostgreSQL and ask natural language questions. An LLM generates SQL queries, executes them against your data, and returns computed answers (sums, averages, counts, etc.).
+
+**Architecture:** Browser UI → FastAPI backend → PostgreSQL (data storage & SQL execution) + OpenAI-compatible LLM (SQL generation & answer formatting).
+
+### Prerequisites
+
+- PostgreSQL running locally
+- An OpenAI-compatible API key (OpenAI, Zhipu AI, Azure OpenAI, etc.)
+- pgai Python library installed (`pip install pgai`)
+
+### Setup
+
+1. Create or update your `.env` file in the project root:
+
+```
+OPENAI_API_KEY=your-api-key
+DB_URL=postgresql://postgres@localhost:5432/postgres
+```
+
+If you use a non-OpenAI provider, your system environment should have `OPENAI_BASE_URL` set to the provider's endpoint, and you should add the matching model name:
+
+```
+LLM_MODEL=glm-4-flash          # Zhipu AI
+LLM_MODEL=gpt-4o-mini          # OpenAI (default)
+```
+
+2. Start PostgreSQL:
+
+```bash
+pg_ctl start -D /path/to/data -l /path/to/log.txt
+```
+
+3. Start the server:
+
+```bash
+cd projects/pgai
+uv run python ../../csv_server.py
+```
+
+4. Open http://localhost:8765 in your browser.
+
+### Usage
+
+1. **Upload** — Drag and drop a CSV file (or click to browse). The file is parsed, loaded into a PostgreSQL table in the `csvdata` schema, and the status dot turns green.
+2. **Ask** — Type a natural language question like "What is the total value of all orders?" or "Which customer has the most purchases?"
+3. **Answer** — The LLM generates a SQL query (with aggregations like SUM, AVG, COUNT), executes it against PostgreSQL, and returns a formatted answer. The executed SQL is shown in a collapsible detail block.
+
+The UI also includes a local JavaScript fallback for basic queries (row counts, column stats) when the backend is unavailable.
 
 ## Tutorials about pgai vectorizer
 - [How to Automatically Create & Update Embeddings in PostgreSQL—With One SQL Query](https://www.timescale.com/blog/how-to-automatically-create-update-embeddings-in-postgresql/)
